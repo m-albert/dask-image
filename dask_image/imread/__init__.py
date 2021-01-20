@@ -5,7 +5,7 @@ __author__ = """John Kirkham"""
 __email__ = "kirkhamj@janelia.hhmi.org"
 
 
-import itertools
+import glob
 import numbers
 import warnings
 
@@ -76,7 +76,7 @@ def imread(fname, nframes=1, *, arraytype="numpy"):
         _map_read_frame,
         chunks=dask.array.core.normalize_chunks(
             (nframes,) + shape[1:], shape),
-        fn=sfname,
+        fnames=glob.glob(sfname),
         arrayfunc=arrayfunc,
         meta=arrayfunc([]).astype(dtype),  # meta overwrites `dtype` argument
     )
@@ -84,8 +84,14 @@ def imread(fname, nframes=1, *, arraytype="numpy"):
     return a
 
 
-def _map_read_frame(block_info=None, **kwargs):
+def _map_read_frame(fnames, arrayfunc, block_info=None, **kwargs):
 
     i, j = block_info[None]['array-location'][0]
 
-    return _utils._read_frame(i=slice(i, j), **kwargs)
+    if len(fnames) > 1:
+        return arrayfunc([_utils._read_frame(fnames[ii], 0,
+                                             arrayfunc=arrayfunc)
+                          for ii in range(i, j)])
+    else:
+        return _utils._read_frame(fnames[0], i=slice(i, j),
+                                  arrayfunc=arrayfunc, **kwargs)
