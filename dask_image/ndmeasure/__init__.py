@@ -372,6 +372,133 @@ def label(image, structure=None):
     return (relabeled, n)
 
 
+# def ensure_unique_labels(label_image):
+#     """
+#     Make sure labels are unique across blocks
+#     """
+#     pass
+
+
+# def relabel_sequential(label_image, offset=1):
+#     pass
+
+
+# def unify_labels(label_image, overlap_depth=0, structure=None):
+#     """
+#     In case of no overlap, use connected component on faces using structuring element.
+#     """
+#     pass
+
+
+# def label(image, structure):
+
+#     label_image = map_blocks(label, image)
+#     label_image = ensure_unique_labels(label_image)
+
+#     unify_labels = unify_labels(label_image, overlap_depth=0, structure=None)
+
+
+def tiled_instance_segmentation(image, segment_func, overlap_depth=0):
+    """
+    tiled_instance_segmentation
+
+    Parameters
+    ----------
+    image : ndarray
+        An array-like object to be labeled.  Any non-zero values in ``image``
+        are counted as features and zero values are considered the background.
+    structure : ndarray, optional
+        A structuring element that defines feature connections.
+        ``structure`` must be symmetric.  If no structuring element is
+        provided, one is automatically generated with a squared connectivity
+        equal to one.  That is, for a 2-D ``image`` array, the default
+        structuring element is::
+
+            [[0,1,0],
+             [1,1,1],
+             [0,1,0]]
+
+    Returns
+    -------
+    label : ndarray or int
+        An integer ndarray where each unique feature in ``image`` has a unique
+        label in the returned array.
+    num_features : int
+        How many objects were found.
+    """
+
+    image = da.asarray(image)
+
+    if overlap_depth > 0:
+        image = da.overlap.overlap(image,
+                                   depth={dim: overlap_depth for dim in range(image.ndim)},
+                                   boundary='none')
+
+    structure = _label.scipy.ndimage.generate_binary_structure(image.ndim, 1)
+
+    labeled_blocks = np.empty(image.numblocks, dtype=object)
+
+    # First, label each block independently, incrementing the labels in that
+    # block by the total number of labels from previous blocks. This way, each
+    # block's labels are globally unique.
+    block_iter = zip(
+        np.ndindex(*image.numblocks),
+        map(functools.partial(operator.getitem, image),
+            da.core.slices_from_chunks(image.chunks))
+    )
+    index, input_block = next(block_iter)
+    # labeled_blocks[index], total = _label.block_ndi_label_delayed(input_block,
+    #                                                               structure)
+
+    labeled_blocks[index] = da.from_delayed(
+        delayed(segment_func)(input_block),
+        shape=input_block.shape,
+        dtype=_label.LABEL_DTYPE
+    )
+
+    total = labeled_blocks[index].max()
+    for index, input_block in block_iter:
+        # labeled_block, n = _label.block_ndi_label_delayed(input_block,
+        #                                                   structure)
+
+        # labeled_block = segment_func(input_block)
+
+        labeled_block = da.from_delayed(
+                delayed(segment_func)(input_block),
+                shape=input_block.shape,
+                dtype=_label.LABEL_DTYPE
+            )
+
+        n = labeled_block.max()
+        block_label_offset = da.where(labeled_block > 0,
+                                      total,
+                                      _label.LABEL_DTYPE.type(0))
+        labeled_block += block_label_offset
+        labeled_blocks[index] = labeled_block
+        total += n
+
+    # Put all the blocks together
+    block_labeled = da.block(labeled_blocks.tolist())
+
+    # Now, build a label connectivity graph that groups labels across blocks.
+    # We use this graph to find connected components and then relabel each
+    # block according to those.
+    label_groups = _label.label_adjacency_graph(block_labeled, structure,
+                                                total)
+    new_labeling = _label.connected_components_delayed(label_groups)
+    relabeled = _label.relabel_blocks(block_labeled, new_labeling)
+    n = da.max(relabeled)
+
+    if overlap_depth > 0:
+        relabeled = da.overlap.trim_internal(
+            relabeled,
+            {dim: overlap_depth for dim in range(image.ndim)}
+        )
+
+    # return (relabeled, n)
+    return relabeled
+
+
 def labeled_comprehension(image,
                           label_image,
                           index,
