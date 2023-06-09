@@ -99,6 +99,9 @@ def _across_block_label_grouping(face, structure, overlap_depth=0, face_dims=Non
     if not overlap_depth:
         
         common_labels = scipy.ndimage.label(face, structure)[0]
+        # when processing labels that don't come from ndimage.label, we need to
+        # ensure equal dtypes
+        common_labels = common_labels.astype(face.dtype)
         matching = np.stack((common_labels.ravel(), face.ravel()), axis=1)
         unique_matching = _unique_axis(matching)
         valid = np.all(unique_matching, axis=1)
@@ -110,23 +113,74 @@ def _across_block_label_grouping(face, structure, overlap_depth=0, face_dims=Non
         grouped = np.stack((i, j), axis=0)
 
     else:
-        # reshape slice into the two parts coming from two chunks
-        face = face.reshape(
-            [2] + [s//2 if dim in face_dims else s
-                    for dim, s in enumerate(face.shape)])
-        
+
         # get label grouping
-        # for now: consider labels as grouped if there's an overlap
+        # for now: consider labels as grouped if they overlap
+        # in either of the overlap regions (in those regions only valid in one of the two blocks when trimmed)
         # idea: consider labels as grouped if intersection over union
         # is higher than a threshold
+        # also look at skimage.segmentation.join_segmentations for perfect overlap
 
-        matching = np.stack((face[0].ravel(), face[1].ravel()), axis=1)
+        # # reshape slice into the two parts coming from two chunks
+        # face_rs = face.reshape(
+        #     [2**len(face_dims)] + [s//2 if dim in face_dims else s
+        #             for dim, s in enumerate(face.shape)])
+
+        # this could be improved by only passing the required chunks to this function
+        # i.e. consider the case of a diagonal block face
+        # only data from two chunks is processed, but data from 2**ndim chunks is passed
+
+
+        # vanilla comparison
+        # slice1 = [slice(None)] * len(face.shape)
+        # slice2 = [slice(None)] * len(face.shape)
+        # for dim in range(face.ndim):
+        #     if dim in face_dims:
+        #         slice1[dim] = slice(0, 2 * overlap_depth)
+        #         slice2[dim] = slice(- 2 * overlap_depth, None)
+        #     else:
+        #         slice1[dim] = slice(None)
+        #         slice2[dim] = slice(None)
+
+        # # take first and last face
+        # # matching = np.stack((face_rs[0].ravel(), face_rs[-1].ravel()), axis=1)
+        # matching = np.stack((face[tuple(slice1)].ravel(),
+        #                      face[tuple(slice2)].ravel()), axis=1)
+
+        # overlap comparison
+        matching = np.zeros((0, 2), dtype=face.dtype)
+        for curr_chunk in [0, 1]:
+            slice1 = [slice(None)] * len(face.shape)
+            slice2 = [slice(None)] * len(face.shape)
+            for dim in range(face.ndim):
+                if dim in face_dims:
+                    if curr_chunk:
+                        # compare labels from the second chunk to the
+                        # (later trimmed) overlap region of the first chunk
+                        slice1[dim] = slice(-overlap_depth, None)
+                        slice2[dim] = slice(overlap_depth, 2 * overlap_depth)
+                    else:
+                        # compare labels from the first chunk to the
+                        # (later trimmed) overlap region of the second chunk
+                        slice1[dim] = slice(-2 * overlap_depth, -overlap_depth)
+                        slice2[dim] = slice(0, overlap_depth)
+                else:
+                    slice1[dim] = slice(None)
+                    slice2[dim] = slice(None)
+
+            matching = np.concatenate([
+                matching,
+                np.stack((face[tuple(slice1)].ravel(),
+                          face[tuple(slice2)].ravel()), axis=1)
+            ], axis=0)
+
+        # sort out zero labels
+        matching = matching[np.all(matching, axis=1)]
+        
+        # ensure unique matching
+        matching = np.sort(matching, axis=1)
         unique_matching = _unique_axis(matching)
-
-        # ignore background labels
-        valid = np.all(unique_matching, axis=1)
-        unique_valid_matching = unique_matching[valid]
-        grouped = unique_valid_matching
+        grouped = unique_matching.T
 
     return grouped
 
@@ -135,7 +189,8 @@ def _across_block_label_grouping_delayed(face, structure, overlap_depth=0, face_
     """Delayed version of :func:`_across_block_label_grouping`."""
     _across_block_label_grouping_ = dask.delayed(_across_block_label_grouping)
     grouped = _across_block_label_grouping_(face, structure, overlap_depth, face_dims)
-    return da.from_delayed(grouped, shape=(2, np.nan), dtype=LABEL_DTYPE)
+    # return da.from_delayed(grouped, shape=(2, np.nan), dtype=LABEL_DTYPE)
+    return da.from_delayed(grouped, shape=(2, np.nan), dtype=face.dtype)
 
 
 @dask.delayed
@@ -174,16 +229,24 @@ def label_adjacency_graph(labels, structure, nlabels, overlap_depth=0):
         This matrix has value 1 at (i, j) if label i is connected to
         label j in the global volume, 0 everywhere else.
     """
+
+    if structure is None:
+        structure = scipy.ndimage.generate_binary_structure(labels.ndim, 1)
+
     faces_slice, faces_dims = _chunk_faces(labels.chunks, labels.shape, structure, overlap_depth)
-    all_mappings = [da.empty((2, 0), dtype=LABEL_DTYPE, chunks=1)]
+    # all_mappings = [da.empty((2, 0), dtype=LABEL_DTYPE, chunks=1)]
+    all_mappings = [da.empty((2, 0), dtype=labels.dtype, chunks=1)]
     for face_slice, face_dims in zip(faces_slice, faces_dims):
 
         face = labels[face_slice]
         mapped = _across_block_label_grouping_delayed(face, structure, overlap_depth, face_dims)
         all_mappings.append(mapped)
+
     all_mappings = da.concatenate(all_mappings, axis=1)
+
     i, j = all_mappings
     mat = _to_csr_matrix(i, j, nlabels + 1)
+
     return mat
 
 
@@ -250,6 +313,7 @@ def _chunk_faces(chunks, shape, structure, overlap_depth=0):
             curr_slice = []
             curr_face_dims = []
             for dim in range(ndim):
+                
                 # keep slice if not on boundary
                 if slices[ind_curr_block][dim] == slices[ind_neigh_block][dim]:
                     curr_slice.append(slices[ind_curr_block][dim])
@@ -259,6 +323,7 @@ def _chunk_faces(chunks, shape, structure, overlap_depth=0):
                         curr_slice.append(slice(
                             slices[ind_curr_block][dim].stop - 2 * overlap_depth,
                             slices[ind_curr_block][dim].stop + 2 * overlap_depth))
+                        curr_face_dims.append(dim)
                     else:
                         curr_slice.append(slice(
                             slices[ind_curr_block][dim].stop - 1,
@@ -308,3 +373,51 @@ def connected_components_delayed(csr_matrix):
     conn_comp = dask.delayed(scipy.sparse.csgraph.connected_components, nout=2)
     return da.from_delayed(conn_comp(csr_matrix, directed=False)[1],
                            shape=(np.nan,), dtype=CONN_COMP_DTYPE)
+
+
+def _apply_additive_label_offsets(labels, use_max_labels=True):
+    """
+    Add offsets to labels in each block such that labels are unique across
+    blocks.
+
+    labels: dask array
+        Array containing labels
+    propagate_max_labels: bool
+        If True, the maximum label in each block is propagated to the next
+        block. If False, the offset applied to each block is obtained by
+        equally dividing the available label space (dtype) among the blocks.
+    """
+
+    if use_max_labels:
+        max_per_block = da.map_blocks(
+            np.max,
+            labels,
+            chunks=(1,)*labels.ndim,
+            dtype=labels.dtype,
+            ).flatten()
+        
+        offset_per_block = max_per_block.\
+            cumsum(axis=0, dtype=labels.dtype)
+        
+        offset_per_block = da.insert(offset_per_block[:-1], 0, 0, axis=0)
+        
+    else:
+        offset_per_block = da.linspace(
+            0,
+            np.iinfo(labels.dtype).max,
+            np.product(labels.numblocks)+1,
+            dtype=labels.dtype,
+            )[:-1]#.reshape(labels.numblocks)
+        
+    offset_per_block = offset_per_block.reshape(labels.numblocks)
+        
+    offset_per_block = offset_per_block.rechunk((1,) * labels.ndim)
+        
+    relabeled = da.map_blocks(
+        lambda x, y: x + y * (x>0),
+        labels,
+        offset_per_block,
+        dtype=labels.dtype,
+    )
+    
+    return relabeled

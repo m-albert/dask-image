@@ -372,30 +372,71 @@ def label(image, structure=None):
     return (relabeled, n)
 
 
-# def ensure_unique_labels(label_image):
-#     """
-#     Make sure labels are unique across blocks
-#     """
-#     pass
+import skimage.segmentation
+def process_labels_at_tile_boundaries(
+        labels,
+        input_block_labels_are_globally_unique=False,
+        input_block_labels_are_approx_sequential=False,
+        overlap_depth=0,
+        ):
+    """
+    Process array containing labels from tiled computation. Labels at the tile
+    boundaries are merged in case they overlap in the overlap region.
 
+    1) make sure labels are unique across blocks
+    2) merge labels in overlap regions
+    3) relabel blocks
 
-# def relabel_sequential(label_image, offset=1):
-#     pass
+    To do:
+    - only overlap labels that coincide in both overlap regions
+      (currently overlap in one of the two is sufficient to merge labels)
 
+    Parameters
+    ----------
+    labels : ndarray
+        Labels
 
-# def unify_labels(label_image, overlap_depth=0, structure=None):
-#     """
-#     In case of no overlap, use connected component on faces using structuring element.
-#     """
-#     pass
+    Returns
+    -------
+    label : ndarray or int
+        An integer ndarray where each unique feature in ``image`` has a unique
+        label in the returned array.
+    """
 
+    labels = da.asarray(labels)
 
-# def label(image, structure):
+    structure = _label.scipy.ndimage.generate_binary_structure(labels.ndim, 3)
 
-#     label_image = map_blocks(label, image)
-#     label_image = ensure_unique_labels(label_image)
+    # ensure sequential labels per block
+    if not input_block_labels_are_globally_unique:
+        if not input_block_labels_are_approx_sequential:
 
-#     unify_labels = unify_labels(label_image, overlap_depth=0, structure=None)
+            labels = da.map_blocks(skimage.segmentation.relabel_sequential,
+                                      labels,
+                                      dtype=labels.dtype,
+            )
+
+        labels = _label._apply_additive_label_offsets(labels, use_max_labels=True)
+
+    # Now, build a label connectivity graph that groups labels across blocks.
+    # We use this graph to find connected components and then relabel each
+    # block according to those.
+
+    # currently using expensive label max!
+    label_groups = _label.label_adjacency_graph(labels, structure,
+                                                labels.max(), overlap_depth=overlap_depth)
+    
+    new_labeling = _label.connected_components_delayed(label_groups)
+
+    relabeled = _label.relabel_blocks(labels, new_labeling)
+
+    if overlap_depth > 0:
+        relabeled = da.overlap.trim_internal(
+            relabeled,
+            {dim: overlap_depth for dim in range(labels.ndim)}
+        )
+
+    return relabeled
 
 
 def tiled_instance_segmentation(image, segment_func, overlap_depth=0):
@@ -434,7 +475,7 @@ def tiled_instance_segmentation(image, segment_func, overlap_depth=0):
                                    depth={dim: overlap_depth for dim in range(image.ndim)},
                                    boundary='none')
 
-    structure = _label.scipy.ndimage.generate_binary_structure(image.ndim, 1)
+    structure = _label.scipy.ndimage.generate_binary_structure(image.ndim, 3)
 
     labeled_blocks = np.empty(image.numblocks, dtype=object)
 
@@ -484,7 +525,7 @@ def tiled_instance_segmentation(image, segment_func, overlap_depth=0):
     # We use this graph to find connected components and then relabel each
     # block according to those.
     label_groups = _label.label_adjacency_graph(block_labeled, structure,
-                                                total)
+                                                total, overlap_depth=overlap_depth)
     new_labeling = _label.connected_components_delayed(label_groups)
     relabeled = _label.relabel_blocks(block_labeled, new_labeling)
     n = da.max(relabeled)
