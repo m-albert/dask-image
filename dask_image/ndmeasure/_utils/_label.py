@@ -60,7 +60,7 @@ def _unique_axis(a, axis=0):
     return r
 
 
-def _across_block_label_grouping(face, structure, overlap_depth=0, face_dims=None):
+def _across_block_label_grouping(face, structure, overlap_depth=0, face_dims=None, iou_threshold=0.8):
     """
     Find a grouping of labels across block faces.
 
@@ -130,66 +130,52 @@ def _across_block_label_grouping(face, structure, overlap_depth=0, face_dims=Non
         # i.e. consider the case of a diagonal block face
         # only data from two chunks is processed, but data from 2**ndim chunks is passed
 
-
-        # vanilla comparison
-        # slice1 = [slice(None)] * len(face.shape)
-        # slice2 = [slice(None)] * len(face.shape)
-        # for dim in range(face.ndim):
-        #     if dim in face_dims:
-        #         slice1[dim] = slice(0, 2 * overlap_depth)
-        #         slice2[dim] = slice(- 2 * overlap_depth, None)
-        #     else:
-        #         slice1[dim] = slice(None)
-        #         slice2[dim] = slice(None)
-
-        # # take first and last face
-        # # matching = np.stack((face_rs[0].ravel(), face_rs[-1].ravel()), axis=1)
-        # matching = np.stack((face[tuple(slice1)].ravel(),
-        #                      face[tuple(slice2)].ravel()), axis=1)
-
         # overlap comparison
-        matching = np.zeros((0, 2), dtype=face.dtype)
-        for curr_chunk in [0, 1]:
-            slice1 = [slice(None)] * len(face.shape)
-            slice2 = [slice(None)] * len(face.shape)
-            for dim in range(face.ndim):
-                if dim in face_dims:
-                    if curr_chunk:
-                        # compare labels from the second chunk to the
-                        # (later trimmed) overlap region of the first chunk
-                        slice1[dim] = slice(-overlap_depth, None)
-                        slice2[dim] = slice(overlap_depth, 2 * overlap_depth)
-                    else:
-                        # compare labels from the first chunk to the
-                        # (later trimmed) overlap region of the second chunk
-                        slice1[dim] = slice(-2 * overlap_depth, -overlap_depth)
-                        slice2[dim] = slice(0, overlap_depth)
-                else:
-                    slice1[dim] = slice(None)
-                    slice2[dim] = slice(None)
+        # matching = np.zeros((0, 2), dtype=face.dtype)
+        slice1 = [slice(None)] * len(face.shape)
+        slice2 = [slice(None)] * len(face.shape)
+        for dim in range(face.ndim):
+            if dim in face_dims:
+                slice1[dim] = slice(-2 * overlap_depth, None)
+                slice2[dim] = slice(0, 2 * overlap_depth)
+            else:
+                slice1[dim] = slice(None)
+                slice2[dim] = slice(None)
 
-            matching = np.concatenate([
-                matching,
-                np.stack((face[tuple(slice1)].ravel(),
-                          face[tuple(slice2)].ravel()), axis=1)
-            ], axis=0)
+        # get IoU based matching
 
-        # sort out zero labels
-        matching = matching[np.all(matching, axis=1)]
-        
-        # ensure unique matching
-        matching = np.sort(matching, axis=1)
-        unique_matching = _unique_axis(matching)
-        grouped = unique_matching.T
+        face1 = face[tuple(slice1)]
+        face2 = face[tuple(slice2)]
+
+        # get IoU between all labels in face1 and face2
+        # consider only already overlapping labels
+        label_pairs = np.stack((face1.ravel(), face2.ravel()), axis=1)
+        unique_label_pairs = _unique_axis(label_pairs)
+        valid = np.all(unique_label_pairs > 0, axis=1)
+        unique_valid_label_pairs = unique_label_pairs[valid]
+        ilabels1, ilabels2 = unique_valid_label_pairs.T
+
+        matching_pairs = []
+        for l1 in ilabels1:
+            for l2 in ilabels2:
+                intersection = np.sum((face1 == l1) * (face2 == l2))
+                if intersection == 0:
+                    continue
+                union = np.sum(face1 == l1) + np.sum(face2 == l2) - intersection
+                iou = intersection / union
+                if iou > iou_threshold:
+                    matching_pairs.append((l1, l2))
+
+        grouped = np.array(matching_pairs).T if len(matching_pairs) > 0\
+            else np.zeros((2, 0), dtype=face.dtype)
 
     return grouped
 
 
-def _across_block_label_grouping_delayed(face, structure, overlap_depth=0, face_dims=None):
+def _across_block_label_grouping_delayed(face, structure, overlap_depth=0, face_dims=None, iou_threshold=0.8):
     """Delayed version of :func:`_across_block_label_grouping`."""
     _across_block_label_grouping_ = dask.delayed(_across_block_label_grouping)
-    grouped = _across_block_label_grouping_(face, structure, overlap_depth, face_dims)
-    # return da.from_delayed(grouped, shape=(2, np.nan), dtype=LABEL_DTYPE)
+    grouped = _across_block_label_grouping_(face, structure, overlap_depth, face_dims, iou_threshold)
     return da.from_delayed(grouped, shape=(2, np.nan), dtype=face.dtype)
 
 
@@ -201,7 +187,7 @@ def _to_csr_matrix(i, j, n):
     return mat.tocsr()
 
 
-def label_adjacency_graph(labels, structure, nlabels, overlap_depth=0):
+def label_adjacency_graph(labels, structure, nlabels, overlap_depth=0, iou_threshold=0.8):
     """
     Adjacency graph of labels between chunks of ``labels``.
 
@@ -233,13 +219,14 @@ def label_adjacency_graph(labels, structure, nlabels, overlap_depth=0):
     if structure is None:
         structure = scipy.ndimage.generate_binary_structure(labels.ndim, 1)
 
-    faces_slice, faces_dims = _chunk_faces(labels.chunks, labels.shape, structure, overlap_depth)
-    # all_mappings = [da.empty((2, 0), dtype=LABEL_DTYPE, chunks=1)]
+    faces_slice, faces_dims = _chunk_faces(
+        labels.chunks, labels.shape, structure, overlap_depth)
     all_mappings = [da.empty((2, 0), dtype=labels.dtype, chunks=1)]
     for face_slice, face_dims in zip(faces_slice, faces_dims):
 
         face = labels[face_slice]
-        mapped = _across_block_label_grouping_delayed(face, structure, overlap_depth, face_dims)
+        mapped = _across_block_label_grouping_delayed(
+            face, structure, overlap_depth, face_dims, iou_threshold)
         all_mappings.append(mapped)
 
     all_mappings = da.concatenate(all_mappings, axis=1)

@@ -439,7 +439,7 @@ def process_labels_at_tile_boundaries(
     return relabeled
 
 
-def tiled_instance_segmentation(image, segment_func, overlap_depth=0):
+def tiled_instance_segmentation(image, segment_func, overlap_depth=0, iou_threshold=0.8):
     """
     tiled_instance_segmentation
 
@@ -488,8 +488,6 @@ def tiled_instance_segmentation(image, segment_func, overlap_depth=0):
             da.core.slices_from_chunks(image.chunks))
     )
     index, input_block = next(block_iter)
-    # labeled_blocks[index], total = _label.block_ndi_label_delayed(input_block,
-    #                                                               structure)
 
     labeled_blocks[index] = da.from_delayed(
         delayed(segment_func)(input_block),
@@ -499,10 +497,6 @@ def tiled_instance_segmentation(image, segment_func, overlap_depth=0):
 
     total = labeled_blocks[index].max()
     for index, input_block in block_iter:
-        # labeled_block, n = _label.block_ndi_label_delayed(input_block,
-        #                                                   structure)
-
-        # labeled_block = segment_func(input_block)
 
         labeled_block = da.from_delayed(
                 delayed(segment_func)(input_block),
@@ -524,8 +518,10 @@ def tiled_instance_segmentation(image, segment_func, overlap_depth=0):
     # Now, build a label connectivity graph that groups labels across blocks.
     # We use this graph to find connected components and then relabel each
     # block according to those.
-    label_groups = _label.label_adjacency_graph(block_labeled, structure,
-                                                total, overlap_depth=overlap_depth)
+    label_groups = _label.label_adjacency_graph(
+        block_labeled, structure, total,
+        overlap_depth=overlap_depth, iou_threshold=iou_threshold
+    )
     new_labeling = _label.connected_components_delayed(label_groups)
     relabeled = _label.relabel_blocks(block_labeled, new_labeling)
     n = da.max(relabeled)
